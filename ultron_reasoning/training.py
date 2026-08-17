@@ -1,0 +1,79 @@
+import math
+from dataclasses import dataclass
+from typing import Iterable
+
+import torch
+from torch.optim import AdamW
+
+from .checkpoint import save_checkpoint
+
+
+@dataclass
+class TrainConfig:
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.1
+    betas: tuple = (0.9, 0.95)
+    eps: float = 1e-8
+    warmup_steps: int = 2000
+    max_steps: int = 100000
+    grad_clip: float = 1.0
+    grad_accumulation_steps: int = 1
+    log_every: int = 10
+    save_every: int = 1000
+
+
+def build_optimizer(model, cfg: TrainConfig):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2 and "norm" not in name.lower() and "bias" not in name.lower():
+            decay.append(p)
+        else:
+            no_decay.append(p)
+    return AdamW(
+        [{"params": decay, "weight_decay": cfg.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
+        lr=cfg.learning_rate,
+        betas=cfg.betas,
+        eps=cfg.eps,
+    )
+
+
+def cosine_lr(step, cfg):
+    if step < cfg.warmup_steps:
+        return (step + 1) / max(1, cfg.warmup_steps)
+    progress = min(1.0, (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps))
+    return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def train(model, loader: Iterable, cfg: TrainConfig, device="cuda", output_dir="checkpoints"):
+    device = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
+    model.to(device)
+    optimizer = build_optimizer(model, cfg)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    model.train()
+    step = 0
+    optimizer.zero_grad(set_to_none=True)
+    for batch in loader:
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            loss = model(input_ids, labels=labels)["loss"] / cfg.grad_accumulation_steps
+        scaler.scale(loss).backward()
+        if (step + 1) % cfg.grad_accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            scale = cosine_lr(step // cfg.grad_accumulation_steps, cfg)
+            for group in optimizer.param_groups:
+                group["lr"] = cfg.learning_rate * scale
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        if step % cfg.log_every == 0:
+            print(f"step={step} loss={loss.item() * cfg.grad_accumulation_steps:.4f}")
+        if step > 0 and step % cfg.save_every == 0:
+            save_checkpoint(f"{output_dir}/step-{step}.pt", model, optimizer, step=step)
+        step += 1
+        if step >= cfg.max_steps:
+            break
+    return model
