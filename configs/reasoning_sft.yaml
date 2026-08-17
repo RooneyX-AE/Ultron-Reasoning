@@ -1,0 +1,13 @@
+model:
+  vocab_size: 65536
+  max_position_embeddings: 32768
+training:
+  stage: reasoning_sft
+  max_steps: 50000
+  micro_batch_size: 1
+  gradient_accumulation_steps: 64
+  learning_rate: 0.00003
+  weight_decay: 0.1
+  grad_clip: 1.0
+  bf16: true
+  loss_mask_prompt: true
